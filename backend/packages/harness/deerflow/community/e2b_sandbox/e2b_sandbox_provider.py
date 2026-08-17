@@ -1943,6 +1943,16 @@ class E2BSandboxProvider(SandboxProvider):
                     sandbox._dead = True
             return
 
+        exit_code = getattr(result, "exit_code", 0)
+        if exit_code not in (0, None):
+            stderr = (getattr(result, "stderr", "") or "").strip()
+            logger.warning(
+                "e2b sync: list command exited with code %s%s",
+                exit_code,
+                f": {stderr}" if stderr else "",
+            )
+            return
+
         stdout = getattr(result, "stdout", "") or ""
         if not stdout:
             if manifest or manifest_dirty:

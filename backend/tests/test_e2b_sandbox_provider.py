@@ -1736,6 +1736,38 @@ def test_sync_outputs_to_host_writes_new_files(monkeypatch, tmp_path):
     assert expected.read_bytes() == b"%PDF-1.4hello"
 
 
+def test_sync_outputs_to_host_preserves_manifest_when_listing_fails(monkeypatch, tmp_path):
+    p = _make_provider()
+    _setup_paths(monkeypatch, tmp_path)
+    paths = Paths(base_dir=tmp_path)
+    thread_dir = paths.thread_dir("t1", user_id="u1")
+    thread_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = thread_dir / ".e2b-output-sync.json"
+    manifest_data = {
+        "version": 1,
+        "sandbox_id": "sb-sync-list-failure",
+        "files": {
+            "outputs/report.txt": {
+                "remote_size": 6,
+                "remote_mtime_ns": 1,
+                "host_size": 6,
+                "host_mtime_ns": 1,
+            }
+        },
+    }
+    manifest_path.write_text(json.dumps(manifest_data), encoding="utf-8")
+
+    files = FakeFilesAPI(store={"/home/user/outputs/report.txt": b"report"})
+    cmds = FakeCommandsAPI([SimpleNamespace(stdout="", stderr="find: I/O error", exit_code=1)])
+    client = FakeClient(sandbox_id="sb-sync-list-failure", commands=cmds, files=files)
+    sb = _make_sandbox(client, sandbox_id="sb-sync-list-failure")
+
+    p._sync_outputs_to_host(sb, thread_id="t1", user_id="u1")
+
+    assert json.loads(manifest_path.read_text(encoding="utf-8")) == manifest_data
+    assert files.read_calls == []
+
+
 def test_sync_outputs_to_host_updates_changed_same_size_file(monkeypatch, tmp_path):
     p = _make_provider()
     _setup_paths(monkeypatch, tmp_path)
