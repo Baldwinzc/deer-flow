@@ -2206,6 +2206,77 @@ class TestChannelManager:
 
         _run(go())
 
+    def test_handle_stream_error_keeps_latest_text_after_values(self, monkeypatch):
+        """A failed stream must not replace newer chunks with an older values snapshot."""
+        from app.channels.manager import ChannelManager
+
+        monkeypatch.setattr("app.channels.manager.STREAM_UPDATE_MIN_INTERVAL_SECONDS", 0.0)
+        monkeypatch.setattr(
+            "app.channels.manager._prepare_artifact_delivery",
+            lambda thread_id, text, artifacts, user_id=None: (text, []),
+        )
+
+        async def go():
+            bus = MessageBus()
+            store = ChannelStore(path=Path(tempfile.mkdtemp()) / "store.json")
+            manager = ChannelManager(bus=bus, store=store)
+            outbound_received = []
+
+            async def capture_outbound(msg):
+                outbound_received.append(msg)
+
+            bus.subscribe_outbound(capture_outbound)
+
+            async def _failing_stream():
+                yield _make_stream_part(
+                    "values",
+                    {
+                        "messages": [
+                            {
+                                "type": "ai",
+                                "content": "Older snapshot",
+                                "tool_calls": [
+                                    {
+                                        "name": "present_files",
+                                        "args": {"filepaths": ["/mnt/user-data/outputs/report.md"]},
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                )
+                yield _make_stream_part(
+                    "messages-tuple",
+                    [
+                        {"id": "ai-1", "content": "Newer streamed answer", "type": "AIMessageChunk"},
+                        {"langgraph_node": "agent"},
+                    ],
+                )
+                raise ConnectionError("stream broken")
+
+            mock_client = _make_mock_langgraph_client()
+            mock_client.runs.stream = MagicMock(return_value=_failing_stream())
+            manager._client = mock_client
+
+            await manager.start()
+            await bus.publish_inbound(
+                InboundMessage(
+                    channel_name="feishu",
+                    chat_id="chat1",
+                    user_id="user1",
+                    text="hi",
+                    thread_ts="om-source-1",
+                )
+            )
+            await _wait_for(lambda: any(m.is_final for m in outbound_received))
+            await manager.stop()
+
+            final = next(message for message in outbound_received if message.is_final)
+            assert final.text == "Newer streamed answer"
+            assert final.artifacts == ["/mnt/user-data/outputs/report.md"]
+
+        _run(go())
+
     def test_handle_feishu_stream_conflict_sends_busy_message(self, monkeypatch):
         import httpx
         from langgraph_sdk.errors import ConflictError

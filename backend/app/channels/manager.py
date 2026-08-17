@@ -2388,6 +2388,11 @@ class ChannelManager:
         finally:
             result = last_values if last_values is not None else {"messages": [{"type": "ai", "content": latest_text}]}
             response_text = _extract_response_text(result)
+            if stream_error is not None and latest_text:
+                # A values snapshot may precede newer message chunks. If the
+                # stream then fails, keep the latest text already shown to the
+                # user instead of replacing it with the older snapshot.
+                response_text = latest_text
             pending_clarification = _has_current_turn_clarification(result)
             artifacts = _extract_artifacts(result)
             # Reuse the storage owner resolved by _handle_chat so artifact delivery
