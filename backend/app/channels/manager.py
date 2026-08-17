@@ -233,6 +233,14 @@ class _BoundIdentityRejection:
 
 
 @dataclass(slots=True)
+class _ThreadCreateLockState:
+    """Per-conversation create lock retained until all callers leave."""
+
+    lock: asyncio.Lock
+    users: int = 0
+
+
+@dataclass(slots=True)
 class _SerializedThreadRunState:
     """Per-thread lock state for channels that queue same-thread turns."""
 
@@ -1026,7 +1034,7 @@ class ChannelManager:
         self._channel_metadata_synced: set[str] = set()
         # Per-conversation locks so concurrent inbound messages for the same
         # chat don't race to create duplicate threads (see _get_or_create_thread).
-        self._thread_create_locks: dict[tuple[str, str, str | None], asyncio.Lock] = {}
+        self._thread_create_locks: dict[tuple[str, str, str | None], _ThreadCreateLockState] = {}
         # Per-thread run locks for channels that want in-manager serialization
         # instead of surfacing the runtime's generic busy reply.
         self._serialized_thread_runs: dict[tuple[str, str], _SerializedThreadRunState] = {}
@@ -2049,9 +2057,13 @@ class ChannelManager:
             return thread_id, False
 
         key = (msg.channel_name, msg.chat_id, msg.topic_id)
-        lock = self._thread_create_locks.setdefault(key, asyncio.Lock())
+        state = self._thread_create_locks.get(key)
+        if state is None:
+            state = _ThreadCreateLockState(lock=asyncio.Lock())
+            self._thread_create_locks[key] = state
+        state.users += 1
         try:
-            async with lock:
+            async with state.lock:
                 # A concurrent message for the same chat may have created the
                 # thread while we were waiting on the lock.
                 thread_id = await self._lookup_thread_id(msg)
@@ -2059,10 +2071,12 @@ class ChannelManager:
                     return thread_id, False
                 return await self._create_thread(client, msg), True
         finally:
-            # Once the thread is stored, later messages short-circuit on the
-            # lookup above and never reach this lock, so it's safe to drop the
-            # entry and keep the registry bounded to in-flight conversations.
-            self._thread_create_locks.pop(key, None)
+            state.users -= 1
+            # A failed creator can leave callers already queued on this state.
+            # Retain it until the last participant exits so a new caller cannot
+            # create a second lock and race the existing queue.
+            if state.users == 0 and self._thread_create_locks.get(key) is state:
+                self._thread_create_locks.pop(key, None)
 
     async def _update_thread_channel_metadata(self, client, msg: InboundMessage, thread_id: str) -> None:
         """Best-effort source metadata backfill for existing IM-created threads."""

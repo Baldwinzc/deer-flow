@@ -726,6 +726,63 @@ class TestChannelManager:
 
         _run(go())
 
+    def test_failed_create_keeps_lock_for_queued_and_new_callers(self):
+        """A failed creator must not remove a lock that still has queued callers."""
+        from app.channels.manager import ChannelManager
+
+        async def go():
+            bus = MessageBus()
+            store = ChannelStore(path=Path(tempfile.mkdtemp()) / "store.json")
+            manager = ChannelManager(bus=bus, store=store)
+
+            create_calls = 0
+            first_create_started = asyncio.Event()
+            release_first_create = asyncio.Event()
+            second_create_started = asyncio.Event()
+            release_second_create = asyncio.Event()
+
+            async def create(*, metadata=None, headers=None):
+                nonlocal create_calls
+                create_calls += 1
+                if create_calls == 1:
+                    first_create_started.set()
+                    await release_first_create.wait()
+                    raise RuntimeError("temporary create failure")
+                if create_calls == 2:
+                    second_create_started.set()
+                    await release_second_create.wait()
+                    return {"thread_id": "thread-2"}
+                return {"thread_id": f"thread-{create_calls}"}
+
+            mock_client = MagicMock()
+            mock_client.threads.create = create
+            manager._client = mock_client
+            msg = InboundMessage(channel_name="slack", chat_id="C1", user_id="U1", text="hi")
+
+            first = asyncio.create_task(manager._get_or_create_thread(mock_client, msg))
+            await first_create_started.wait()
+            second = asyncio.create_task(manager._get_or_create_thread(mock_client, msg))
+            await asyncio.sleep(0)
+            release_first_create.set()
+            with pytest.raises(RuntimeError, match="temporary create failure"):
+                await first
+
+            await second_create_started.wait()
+            third = asyncio.create_task(manager._get_or_create_thread(mock_client, msg))
+            await asyncio.sleep(0)
+
+            # The third caller must still queue behind the second caller's lock.
+            assert create_calls == 2
+            release_second_create.set()
+            (second_id, second_created), (third_id, third_created) = await asyncio.gather(second, third)
+
+            assert (second_id, second_created) == ("thread-2", True)
+            assert (third_id, third_created) == ("thread-2", False)
+            assert create_calls == 2
+            assert manager._thread_create_locks == {}
+
+        _run(go())
+
     def test_fetch_gateway_includes_internal_auth_headers(self, monkeypatch):
         from app.channels.manager import ChannelManager
 
